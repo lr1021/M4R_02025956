@@ -1,0 +1,179 @@
+functions {
+  real icar_normal_lpdf(vector icar_phi, int N, array[] int icar_node1,
+                        array[] int icar_node2, real s) {
+    // pairwise difference formula
+    return -0.5 * dot_self(icar_phi[icar_node1] - icar_phi[icar_node2]) * (1/s*s);
+                        }
+  real car_normal_lpdf(vector phi, int N, int data_N_nodes, int data_ts_N_edges, int data_ts_N_edges_diag,
+                       int data_N_edges, int data_N_edges_diag,
+                       vector w1, vector w2, vector p,
+                       array[] int data_node1, array[] int data_node2,
+                       array[] int data_node1_diag, array[] int data_node2_diag,
+                       array[] int data_ts_node1, array[] int data_ts_node2,
+                       array[] int data_ts_edge,
+                       array[] int data_coordinate_index, array[] int offset_data_coordinate_index,
+                       real sigma) {
+
+      real diagonal = 1e-10;
+      real off_diagonal = 1e-10;
+      
+      // break input vector into separate variables
+      vector[N] phi1;
+      phi1 = phi[1:N];
+      vector[N] phi2;
+      phi2 = phi[(N+1):(2*N)];
+      
+      // node list indexing of data
+      vector[data_ts_N_edges] phi1_n1 = phi1[data_ts_node1];
+      vector[data_ts_N_edges] phi1_n2 = phi1[data_ts_node2];
+      vector[data_ts_N_edges] phi2_n1 = phi2[data_ts_node1];
+      vector[data_ts_N_edges] phi2_n2 = phi2[data_ts_node2];
+      
+      // off-diagonal component
+      off_diagonal += dot_product(w1[data_ts_edge], phi1_n1 .* phi1_n2);
+      off_diagonal += dot_product(w2[data_ts_edge], phi2_n1 .* phi2_n2);
+      off_diagonal += dot_product(p[data_ts_edge], (phi1_n1 .* phi2_n2) + (phi2_n1 .* phi1_n2));
+      
+      vector[data_N_nodes] c1 = rep_vector(0.0, data_N_nodes);
+      vector[data_N_nodes] c2 = rep_vector(0.0, data_N_nodes);
+      vector[data_N_nodes] t1 = rep_vector(0.0, data_N_nodes);
+      vector[data_N_nodes] t2 = rep_vector(0.0, data_N_nodes);
+      vector[data_N_nodes] t3 = rep_vector(0.0, data_N_nodes);
+      
+      t1[data_node1] += abs(w1);
+      t1[data_node2] += abs(w1);
+      t2[data_node1] += abs(w2);
+      t2[data_node2] += abs(w2);
+      t3[data_node1_diag] += abs(p);
+      t3[data_node2_diag] += abs(p);
+      c1 = t1 + t3;
+      c2 = t2 + t3;
+      
+      // diagonal term
+      diagonal += dot_product(c1[data_coordinate_index], phi1 .* phi1);
+      diagonal += dot_product(c2[data_coordinate_index], phi2 .* phi2);
+      diagonal -= 2 * dot_product(p[offset_data_coordinate_index], phi1 .* phi2);
+      
+      // divide by 2 * conditional variance
+      return - (diagonal - 2*off_diagonal)/(2 * sigma * sigma);
+  }
+}
+data {
+  // number of data points
+  int<lower=0> N;
+  
+  // number of topological entities in data
+  int<lower=0> data_N_nodes;
+  int<lower=0> data_N_edges;
+  int<lower=0> data_N_edges_diag;
+  int<lower=0> data_ts_N_edges;
+  int<lower=0> data_ts_N_edges_diag;
+  int<lower=0> data_wN_adj;
+  int<lower=0> data_pN_adj;
+  
+  // number of time steps
+  int<lower=0> T;
+  
+  // adjacency lists (inter- (reflexive) and intra- variable)
+  array[data_N_edges] int<lower=1, upper=data_N_nodes> data_node1;
+  array[data_N_edges] int<lower=1, upper=data_N_nodes> data_node2;
+  array[data_N_edges_diag] int<lower=1, upper=data_N_nodes> data_node1_diag;
+  array[data_N_edges_diag] int<lower=1, upper=data_N_nodes> data_node2_diag;
+  
+  // adjacency lists (inter- (reflexive) and intra- variable) for each time step
+  array[data_ts_N_edges] int<lower=1, upper=N> data_ts_node1;
+  array[data_ts_N_edges] int<lower=1, upper=N> data_ts_node2;
+  array[data_ts_N_edges_diag] int<lower=1, upper=N> data_ts_node1_diag;
+  array[data_ts_N_edges_diag] int<lower=1, upper=N> data_ts_node2_diag;
+  
+  // second order adjacency entities for each time step
+  array[data_ts_N_edges] int<lower=1, upper=data_N_edges> data_ts_edge;
+  array[data_ts_N_edges_diag] int<lower=1, upper=data_N_edges_diag> data_ts_edge_diag;
+  
+  // second order adjacency lists
+  array[data_wN_adj] int<lower=1, upper=data_N_edges> data_wedge1;
+  array[data_wN_adj] int<lower=1, upper=data_N_edges> data_wedge2;
+  array[data_pN_adj] int<lower=1, upper=data_N_edges_diag> data_pedge1;
+  array[data_pN_adj] int<lower=1, upper=data_N_edges_diag> data_pedge2;
+  
+  // outcome variable
+  array[N] real y1; // var1 outcome
+  array[N] real y2; // var2 outcome
+  
+  // data coordinate indices
+  array[N] int <lower=1, upper=data_N_nodes> data_coordinate_index;
+  array[N] int <lower=1+data_N_edges, upper=data_N_nodes+data_N_edges> offset_data_coordinate_index;
+  
+  // time step index for each data point
+  array[N] int <lower=1, upper=T> time_step;
+}
+transformed data {
+  // combine observations in one vector
+  vector[2 * N] y_combined;
+
+  for (i in 1:N) {
+    y_combined[i] = y1[i];
+    y_combined[N + i] = y2[i];
+}
+}
+parameters {
+  // latent correlation
+  vector[data_N_edges] latent_w1;
+  vector[data_N_edges] latent_w2;
+  vector[data_N_edges_diag] latent_p;
+  
+  // latent correlation mean
+  real mw1;
+  real mw2;
+  real mp;
+  
+  // second order CAR conditional standard deviations
+  real<lower=0> sw1;
+  real<lower=0> sw2;
+  real<lower=0> sp;
+}
+transformed parameters {
+  // variable 1, variable 2 inter- and intra- variable spatial effect correlations
+  vector[data_N_edges] w1;
+  vector[data_N_edges] w2;
+  vector[data_N_edges_diag] p;
+  
+  w1 = 2 * Phi((latent_w1 + mw1)/3) -1;
+  w2 = 2 * Phi((latent_w2 + mw2)/4) -1;
+  p = 2 * Phi((latent_p + mp)/1.5) -1;
+}
+model {
+  // correlations CAR conditional standard deviations
+  sw1 ~ normal(0, 1);
+  sw2 ~ normal(0, 1);
+  sp ~ normal(0, 1);
+  
+  // latent correlation means priors
+  mw1 ~ normal(0, 0.2);
+  mw2 ~ normal(0, 0.2);
+  mp ~ normal(0, 0.2);
+  
+  // latent correlation priors
+  latent_w1 ~ icar_normal(data_wN_adj, data_wedge1, data_wedge2, sw1);
+  latent_w2 ~ icar_normal(data_wN_adj, data_wedge1, data_wedge2, sw2);
+  latent_p ~ icar_normal(data_pN_adj, data_pedge1, data_pedge2, sp);
+  
+  // likelihood
+  y_combined ~ car_normal(N, data_N_nodes, data_ts_N_edges, data_ts_N_edges_diag,
+                   data_N_edges, data_ts_N_edges_diag,
+                   w1, w2, p,
+                   data_node1, data_node2,
+                   data_node1_diag, data_node2_diag,
+                   data_ts_node1, data_ts_node2,
+                   data_ts_edge,
+                   data_coordinate_index, offset_data_coordinate_index,
+                   0.925);
+  
+  // soft sum-to-zero constraints
+  sum(y_combined) ~ normal(0, 0.001 * 2 * N);
+  sum(latent_w1) ~ normal(0, 0.001 * data_N_edges);
+  sum(latent_w2) ~ normal(0, 0.001 * data_N_edges);
+  sum(latent_p) ~ normal(0, 0.001 * data_N_edges_diag);
+}
+generated quantities {
+}

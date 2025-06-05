@@ -1,0 +1,463 @@
+# Packages and Libraries
+```{r message=FALSE, warning=FALSE, include=FALSE}
+require(data.table) # for data mangling require(tidyverse) # for data mangling require(ggplot2) # for plotting require(hexbin) # for plotting require(bayesplot) # for plotting Stan outputs require(knitr) # for Rmarkdown require(kableExtra) # for Rmarkdown require(cmdstanr) # for Stan
+require(tidyverse) # data mangling
+require(ggplot2) # plotting
+require(hexbin) # plotting
+require(bayesplot) # Stan plotting
+require(knitr)
+require(kableExtra)
+require(cmdstanr)
+library(readr)
+library(dplyr)
+library(stringr)
+library(glue)
+library(posterior)
+set_cmdstan_path("/Users/lucaratzinger/cmdstan/cmdstan-2.36.0")
+```
+# Home Directory
+```{r message=FALSE, warning=FALSE, include=FALSE}
+home.dir <- "/Volumes/KINGSTON/M4R_usb"
+```
+# Zone, Geography, Nodes (1st order edges), Edges (2nd order edges)
+```{r message=FALSE, warning=FALSE, include=FALSE}
+zone = 0
+# ZONE DATA (lat, lon, nodes, edges)
+zd <- read_csv(glue("{home.dir}/smaller_zone/zone_{zone}/c3_ABLE_1950_08.csv"),
+                      col_select = c("time_step", "latitude_rank", "longitude_rank"), show_col_types = FALSE);
+##
+# Find the center of the grid
+center_latitude <- median(zd$latitude_rank)
+center_longitude <- median(zd$longitude_rank)
+##
+# adjust latitude and longitude rank to selected area
+zone_min_lat = min(zd$latitude_rank)
+zone_min_lon = min(zd$longitude_rank)
+zd$latitude_rank = zd$latitude_rank - zone_min_lat + 1
+zd$longitude_rank = zd$longitude_rank - zone_min_lon + 1
+zone_n_lat = max(zd$latitude_rank)
+zd$coord_index = zone_n_lat*(zd$longitude_rank-1) + zd$latitude_rank
+zd <- zd %>% filter(time_step == min(zd$time_step))
+
+# Nodes (Location Adjacency)
+node_path <- glue("{home.dir}/smaller_nodes/nodes_zone_{zone}.csv")
+node <- read_csv(node_path, col_select = c("node1", "node2"), show_col_types = FALSE);
+node1 <- node$node1
+node2 <- node$node2
+
+N_nodes <- max(node2)
+
+# diagonal adjacency (reflexive) for intervariable connections
+node1_diag <- c(node1, 1:N_nodes)
+node2_diag <- c(node2, 1:N_nodes)
+
+N_edges <- length(node1)
+N_edges_diag <- length(node1_diag)
+
+# Edges (Node Connections Adjacency): w intra variable, p intervariable (reflexive)
+wedge_data <- read_csv(glue("{home.dir}/smaller_nodes/wedges_zone_{zone}.csv"),
+                       col_select = c("wedge1", "wedge2"), show_col_types = FALSE);
+wedge1 = wedge_data$wedge1
+wedge2 = wedge_data$wedge2
+
+pedge_data <- read_csv(glue("{home.dir}/smaller_nodes/pedges_zone_{zone}.csv"),
+                       col_select = c("pedge1", "pedge2"), show_col_types = FALSE);
+pedge1 = pedge_data$pedge1
+pedge2 = pedge_data$pedge2
+
+wN_adj = length(wedge1)
+pN_adj = length(pedge1)
+```
+
+# Data: Single Event, Multiple Timesteps
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Variables
+# sp : Surface pressure
+# tcw : Total column water
+# u10 : 10 metre U wind component
+# v10 : 10 metre V wind component
+# t2m : 2 metre temperature
+# lsm : Land-sea mask
+# u100 : 100 metre U wind component
+# v100 : 100 metre V wind component
+# e : Evaporation
+# tp : Total precipitation
+
+extract_var1 = "tp"
+extract_var2 = "w10"
+```
+
+```{r}
+prepare_zone_data <- function(
+  home.dir, zone, extract_var1, extract_var2, center_latitude, center_longitude,
+  time_range, zone_min_lat, zone_min_lon, zone_n_lat,
+  node1, node2, node1_diag, node2_diag, wedge1, wedge2, pedge1, pedge2,
+  N_edges, N_edges_diag, wN_adj, pN_adj, sparse = FALSE, zd = NULL
+) {
+  # Load data
+  if (sparse) {
+    data <- readr::read_csv(glue::glue("{home.dir}/filtered_smaller_zone/zone_{zone}/c3_ALMA_1966_06(q90).csv"),
+                            col_select = c("time_step", "latitude_rank", "longitude_rank", extract_var1, extract_var2),
+                            show_col_types = FALSE)
+  } else {
+    data <- readr::read_csv(glue::glue("{home.dir}/smaller_zone/zone_{zone}/c3_ALMA_1966_06.csv"),
+                            col_select = c("time_step", "latitude_rank", "longitude_rank", extract_var1, extract_var2),
+                            show_col_types = FALSE)
+  }
+
+  # Filter grid around center
+  grid_size <- 10
+  data <- data %>%
+    dplyr::filter(latitude_rank >= (center_latitude - grid_size) & latitude_rank <= (center_latitude + grid_size)) %>%
+    dplyr::filter(longitude_rank >= (center_longitude - grid_size) & longitude_rank <= (center_longitude + grid_size))
+  data <- data[data$time_step >= time_range[1] & data$time_step <= time_range[2], ]
+  data$latitude_rank <- data$latitude_rank - zone_min_lat + 1
+  data$longitude_rank <- data$longitude_rank - zone_min_lon + 1
+  data$coord_index <- zone_n_lat * (data$longitude_rank - 1) + data$latitude_rank
+  data$time_step <- data$time_step - min(data$time_step) + 1
+  data <- data[order(data$time_step, data$coord_index), ]
+
+  # Scale variables
+  y1 <- scale(data[[extract_var1]])
+  y2 <- scale(data[[extract_var2]])
+  data_y1_mean <- attr(y1, "scaled:center")
+  data_y1_sd   <- attr(y1, "scaled:scale")
+  data_y2_mean <- attr(y2, "scaled:center")
+  data_y2_sd   <- attr(y2, "scaled:scale")
+  y1 <- as.numeric(y1)
+  y2 <- as.numeric(y2)
+
+  N <- length(y1)
+  time_step <- data$time_step
+  T <- max(time_step)
+  unique_time_step <- unique(time_step)
+  data_coordinate_index <- data$coord_index
+
+  # Time step start/end indices
+  time_step_start <- c()
+  time_step_end <- c()
+  previous_ts <- 0
+
+  for (i in 1:N) {
+    current_ts <- time_step[i]
+    if (current_ts != previous_ts) {
+      time_step_start <- c(time_step_start, i)
+      time_step_end <- c(time_step_end, i - 1)
+    }
+    previous_ts <- current_ts
+  }
+  time_step_end <- c(time_step_end[2:length(unique_time_step)], N)
+
+  # Node connections per time step
+  data_ts_node1 <- c(); data_ts_node2 <- c(); data_ts_edge <- c()
+  for (ti in seq_along(unique_time_step)) {
+    t <- unique_time_step[ti]
+    t_nodes <- data$coord_index[data$time_step == t]
+    for (i in 1:N_edges) {
+      n1_match <- match(node1[i], t_nodes, nomatch = 0)
+      n2_match <- match(node2[i], t_nodes, nomatch = 0)
+      if (n1_match > 0 && n2_match > 0) {
+        data_ts_node1 <- c(data_ts_node1, n1_match + time_step_start[ti] - 1)
+        data_ts_node2 <- c(data_ts_node2, n2_match + time_step_start[ti] - 1)
+        data_ts_edge <- c(data_ts_edge, i)
+      }
+    }
+  }
+
+  # Diagonal edges
+  data_ts_node1_diag <- data_ts_node1
+  data_ts_node2_diag <- data_ts_node2
+  data_ts_edge_diag <- data_ts_edge
+  for (ti in seq_along(unique_time_step)) {
+    t <- unique_time_step[ti]
+    t_nodes <- data$coord_index[data$time_step == t]
+    for (i in (N_edges + 1):N_edges_diag) {
+      if (node1_diag[i] != node2_diag[i]) print("something is wrong")
+      n1_match <- match(node1_diag[i], t_nodes, nomatch = 0)
+      n2_match <- match(node2_diag[i], t_nodes, nomatch = 0)
+      if (n1_match > 0 && n2_match > 0) {
+        data_ts_node1_diag <- c(data_ts_node1_diag, n1_match + time_step_start[ti] - 1)
+        data_ts_node2_diag <- c(data_ts_node2_diag, n2_match + time_step_start[ti] - 1)
+        data_ts_edge_diag <- c(data_ts_edge_diag, i)
+      }
+    }
+  }
+  data_ts_N_edges <- length(data_ts_node1)
+  data_ts_N_edges_diag <- length(data_ts_node1_diag)
+
+  # Edge filtering
+  data_edges <- sort(unique(data_ts_edge))
+  data_edges_diag <- sort(unique(data_ts_edge_diag))
+  data_N_edges <- length(data_edges)
+  data_N_edges_diag <- length(data_edges_diag)
+
+  data_node1 <- node1[data_edges]
+  data_node2 <- node2[data_edges]
+  data_node1_diag <- node1_diag[data_edges_diag]
+  data_node2_diag <- node2_diag[data_edges_diag]
+
+  # Wedges and Pedges
+  data_wedges <- which(wedge1 %in% data_edges & wedge2 %in% data_edges)
+  data_pedges <- which(pedge1 %in% data_edges_diag & pedge2 %in% data_edges_diag)
+
+  data_wedge1 <- wedge1[data_wedges]
+  data_wedge2 <- wedge2[data_wedges]
+  data_wN_adj <- length(data_wedge1)
+
+  data_pedge1 <- pedge1[data_pedges]
+  data_pedge2 <- pedge2[data_pedges]
+  data_pN_adj <- length(data_pedge1)
+
+  # Edge map
+  edge_map <- setNames(seq_along(data_edges), data_edges)
+  edge_diag_map <- setNames(seq_along(data_edges_diag), data_edges_diag)
+
+  edge_map_df <- data.frame(edge_id = seq_along(data_edges), edge_key = data_edges)
+  edge_diag_map_df <- data.frame(edge_id = seq_along(data_edges_diag), edge_key = data_edges_diag)
+
+  if (sparse) {
+    readr::write_csv(edge_map_df, glue::glue("{home.dir}/R/notebook_models/[{time_range[1]}-{time_range[2]}]_sparse_edge_map.csv"))
+    readr::write_csv(edge_diag_map_df, glue::glue("{home.dir}/R/notebook_models/[{time_range[1]}-{time_range[2]}]_sparse_edge_diag_map.csv"))
+  } else {
+    readr::write_csv(edge_map_df, glue::glue("{home.dir}/R/notebook_models/edge_map.csv"))
+    readr::write_csv(edge_diag_map_df, glue::glue("{home.dir}/R/notebook_models/edge_diag_map.csv"))
+  }
+
+  data_ts_edge <- as.integer(edge_map[as.character(data_ts_edge)])
+  data_ts_edge_diag <- as.integer(edge_diag_map[as.character(data_ts_edge_diag)])
+  data_wedge1 <- as.integer(edge_map[as.character(data_wedge1)])
+  data_wedge2 <- as.integer(edge_map[as.character(data_wedge2)])
+  data_pedge1 <- as.integer(edge_diag_map[as.character(data_pedge1)])
+  data_pedge2 <- as.integer(edge_diag_map[as.character(data_pedge2)])
+
+  # Node indexing
+  data_nodes <- sort(unique(data_coordinate_index))
+  data_N_nodes <- length(data_nodes)
+  node_map <- setNames(seq_along(data_nodes), data_nodes)
+  if (is.null(zd)) zd <- data
+  zone_nodes <- sort(unique(zd$coord_index))
+
+  data_node1 <- as.integer(node_map[as.character(data_node1)])
+  data_node2 <- as.integer(node_map[as.character(data_node2)])
+  data_node1_diag <- as.integer(node_map[as.character(data_node1_diag)])
+  data_node2_diag <- as.integer(node_map[as.character(data_node2_diag)])
+  data_coordinate_index <- as.integer(node_map[as.character(data_coordinate_index)])
+  offset_data_coordinate_index <- data_coordinate_index + data_N_edges
+
+  return(data_for_sampling <- list(
+  N = N,
+  data_N_nodes = data_N_nodes,
+  data_N_edges = data_N_edges,
+  data_N_edges_diag = data_N_edges_diag,
+  data_ts_N_edges = data_ts_N_edges,
+  data_ts_N_edges_diag = data_ts_N_edges_diag,
+  data_wN_adj = data_wN_adj,
+  data_pN_adj = data_pN_adj,
+  T = T,
+  
+  data_node1 = data_node1,
+  data_node2 = data_node2,
+  data_node1_diag = data_node1_diag,
+  data_node2_diag = data_node2_diag,
+  data_ts_node1 = data_ts_node1,
+  data_ts_node2 = data_ts_node2,
+  data_ts_node1_diag = data_ts_node1_diag,
+  data_ts_node2_diag = data_ts_node2_diag,
+  data_ts_edge = data_ts_edge,
+  data_ts_edge_diag = data_ts_edge_diag,
+  
+  data_wedge1 = data_wedge1,
+  data_wedge2 = data_wedge2,
+  data_pedge1 = data_pedge1,
+  data_pedge2 = data_pedge2,
+  
+  y1 = y1,
+  y2 = y2,
+  data_y1_mean = data_y1_mean,
+  data_y2_mean = data_y2_mean,
+  data_coordinate_index = data_coordinate_index,
+  offset_data_coordinate_index = offset_data_coordinate_index,
+  time_step = time_step))
+}
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+compile_stan_model <- function(model_n, home.dir) {
+  # File paths
+  model_text_path <- glue("{home.dir}/R/notebook_models/nm{model_n}")
+  stan_file_path <- glue("{home.dir}/R/notebook_models/nm_stan{model_n}.stan")
+
+  # Read model text
+  model_text <- paste(readLines(model_text_path), collapse = "\n")
+
+  # Write stan file only if contents differ
+  if (!file.exists(stan_file_path) ||
+      paste(readLines(stan_file_path), collapse = "\n") != model_text) {
+    writeLines(gsub('\t', ' ', model_text), stan_file_path)
+  }
+
+  # Compile using cmdstanr (only if needed)
+  model_compiled_cmdstanr <- cmdstan_model(stan_file_path, force_recompile = FALSE)
+
+  return(model_compiled_cmdstanr)
+}
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+run_and_save_model_output <- function(model_compiled_cmdstanr, data_for_sampling, home.dir,
+                                      model_n, time_range, sparse = FALSE, seed = 123,
+                                      chains = 2, iter_warmup = 5000, iter_sampling = 5000) {
+
+  # Create modular folder if it doesn't exist
+  out_dir <- glue("{home.dir}/R/modular_long")
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+  # Sample
+  model_fit <- model_compiled_cmdstanr$sample(
+    data = data_for_sampling,
+    seed = seed,
+    chains = chains,
+    parallel_chains = chains,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    refresh = 50,
+    save_warmup = TRUE,
+    thin = 1
+  )
+
+  # Save fit object
+  fit_rds_path <- glue("{out_dir}/notebook_run_model{model_n}.rds")
+  model_fit$save_object(file = fit_rds_path)
+
+  # Reload for processing
+  model_fit_read <- readRDS(fit_rds_path)
+
+  # Summary
+  all_summary <- model_fit_read$summary(
+    variables = NULL,
+    posterior::default_convergence_measures(),
+    posterior::default_summary_measures()
+  )
+
+  # One-dimensional summaries
+  onedim_summary <- all_summary %>%
+    filter(str_detect(variable, "^\\w+$") | str_detect(variable, "^\\w+\\[\\d+\\]$")) %>%
+    mutate(base = if_else(str_detect(variable, "\\["), 
+                          str_extract(variable, "^[^\\[]+"), 
+                          variable))
+
+  # Non-indexed
+  non_indexed <- onedim_summary %>%
+    filter(!str_detect(variable, "\\["))
+
+  # Indexed subset
+  top_indexed <- onedim_summary %>%
+    filter(base %in% c("w1", "w2", "p", "phi"), str_detect(variable, "\\[")) %>%
+    arrange(desc(rhat)) %>%
+    group_by(base) %>%
+    slice(1:20) %>%
+    ungroup()
+
+  # Final DF: top + all non-indexed
+  final_df <- bind_rows(non_indexed, top_indexed) %>%
+    mutate(across(where(is.numeric), ~ formatC(.x, format = "f", digits = 3))) %>%
+    select(variable, rhat, ess_bulk, ess_tail, mean, median, sd, mad)
+
+  # File name for summary
+  fn_summary <- if (sparse) {
+    glue("{out_dir}/nms{model_n}[{time_range[1]}-{time_range[2]}]_sparse.csv")
+  } else {
+    glue("{out_dir}/nms{model_n}[{time_range[1]}-{time_range[2]}].csv")
+  }
+  write_csv(final_df, fn_summary)
+
+  # Extract draws
+  all_draws <- model_fit_read$draws(
+    variables = c("lp__", "w1", "w2", "p"),
+    inc_warmup = FALSE,
+    format = "draws_array"
+  )
+  all_draws_df <- as_draws_df(all_draws)
+
+  # File name for draws
+  fn_draws <- if (sparse) {
+    glue("{out_dir}/nm{model_n}[{time_range[1]}-{time_range[2]}]_sparse_draws.csv")
+  } else {
+    glue("{out_dir}/nm{model_n}[{time_range[1]}-{time_range[2]}]_draws.csv")
+  }
+  write_csv(all_draws_df, fn_draws)
+
+  # Return summary and paths (optional)
+  return(list(summary = final_df,
+              summary_path = fn_summary,
+              draws_path = fn_draws,
+              rds_path = fit_rds_path))
+}
+```
+
+```{r}
+# Define custom combinations
+run_configs <- list(
+  list(model_n = 19, sparse = TRUE,  time_range = c(1, 3)),
+  list(model_n = 19, sparse = TRUE, time_range = c(83, 85))
+)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Loop over the list
+for (cfg in run_configs) {
+  model_n <- cfg$model_n
+  sparse <- cfg$sparse
+  time_range <- cfg$time_range
+
+  message(glue::glue("Running model {model_n}, sparse = {sparse}, time range = [{time_range[1]} - {time_range[2]}]"))
+
+  # Prepare data
+  data_for_sampling <- prepare_zone_data(
+    home.dir = home.dir,
+    zone = zone,
+    extract_var1 = extract_var1,
+    extract_var2 = extract_var2,
+    center_latitude = center_latitude,
+    center_longitude = center_longitude,
+    time_range = time_range,
+    zone_min_lat = zone_min_lat,
+    zone_min_lon = zone_min_lon,
+    zone_n_lat = zone_n_lat,
+    node1 = node1,
+    node2 = node2,
+    node1_diag = node1_diag,
+    node2_diag = node2_diag,
+    wedge1 = wedge1,
+    wedge2 = wedge2,
+    pedge1 = pedge1,
+    pedge2 = pedge2,
+    N_edges = N_edges,
+    N_edges_diag = N_edges_diag,
+    wN_adj = wN_adj,
+    pN_adj = pN_adj,
+    sparse = sparse,
+    zd = zd
+  )
+
+  # Compile model
+  model <- compile_stan_model(model_n = model_n, home.dir = home.dir)
+
+  # Run and save
+  result <- run_and_save_model_output(
+    model_compiled_cmdstanr = model,
+    data_for_sampling = data_for_sampling,
+    home.dir = home.dir,
+    model_n = model_n,
+    time_range = time_range,
+    sparse = sparse,
+    seed = 123,
+    chains = 2,
+    iter_warmup = 4000,
+    iter_sampling = 4000
+  )
+
+  message(glue::glue("Completed: model {model_n}, sparse = {sparse}, time range = [{time_range[1]} - {time_range[2]}]"))
+}
+```
+
+
