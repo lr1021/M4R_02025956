@@ -23,3 +23,7 @@
 Model output corresponds to data from Hurricane Alma, 11:00–13:00 UTC, June 8, 1966.  
 - **First variable:** Total precipitation  
 - **Second variable (and filtering variable):** Wind speed at 10 metres above the surface
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
